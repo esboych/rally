@@ -25,6 +25,9 @@ from rally.benchmark import validation
 from rally.benchmark.wrappers import network as network_wrapper
 from rally import consts
 from rally import exceptions
+import threading
+import time
+import re
 
 
 class VMTasks(nova_utils.NovaScenario, vm_utils.VMScenario,
@@ -127,3 +130,196 @@ class VMTasks(nova_utils.NovaScenario, vm_utils.VMScenario,
                         self._dissociate_floating_ip(server, fip["ip"])
                     net_wrap.delete_floating_ip(fip["id"], wait=True)
                 self._delete_server(server, force=force_delete)
+
+    @types.set(image=types.ImageResourceType,
+               flavor=types.FlavorResourceType)
+    @validation.image_valid_on_flavor("flavor", "image")
+    @validation.file_exists("clientscript")
+    @validation.file_exists("serverscript")
+    @validation.number("port", minval=1, maxval=65535, nullable=True,
+                       integer_only=True)
+    @validation.external_network_exists("floating_network")
+    @validation.required_services(consts.Service.NOVA, consts.Service.CINDER)
+    @validation.required_openstack(users=True)
+    @base.scenario(context={"cleanup": ["nova", "cinder"],
+                            "keypair": {}, "allow_ssh": {}})
+    def boot_runcommand_on_two_servers_delete(self, image, flavor,
+                               clientscript, serverscript, interpreter,
+                               username,
+                               password=None,
+                               volume_args=None,
+                               floating_network=None,
+                               port=22,
+                               force_delete=False,
+                               **kwargs):
+        """Boot 2 servers, run a script that outputs JSON, delete the server.
+
+        Example Script in doc/samples/tasks/support/instance_dd_test.sh
+
+        :param image: glance image name to use for the vm
+        :param flavor: VM flavor name
+        :param script: script to run on server, must output JSON mapping
+                       metric names to values (see the sample script below)
+        :param interpreter: server's interpreter to run the script
+        :param username: ssh username on server, str
+        :param password: Password on SSH authentication
+        :param volume_args: volume args for booting server from volume
+        :param floating_network: external network name, for floating ip
+        :param port: ssh port for SSH connection
+        :param force_delete: whether to use force_delete for servers
+        :param **kwargs: extra arguments for booting the server
+        :returns: dictionary with keys `data' and `errors':
+                  data: dict, JSON output from the script
+                  errors: str, raw data from the script's stderr stream
+        """
+
+        print "boot_runcommand_on_two_servers_delete"
+
+        if volume_args:
+            volume = self._create_volume(volume_args["size"], imageRef=None)
+            kwargs["block_device_mapping"] = {"vda": "%s:::1" % volume.id}
+            print "volume.id: ", volume.id
+
+
+        net_wrap = network_wrapper.wrap(self.clients)
+        kwargs.update({"auto_assign_nic": True,
+                       "key_name": keypair.Keypair.KEYPAIR_NAME})
+
+        iperf_client = self._boot_server(
+            self._generate_random_name("rally_iperf_client_"),
+            image, flavor, **kwargs)
+
+        print " sleeping 10 sec.."
+        time.sleep(10)
+        print " end sleeping 10 sec.."
+
+        iperf_server = self._boot_server(
+            self._generate_random_name("rally_iperf_server_"),
+            image, flavor, **kwargs)
+
+
+        if not iperf_client.networks:
+            raise RuntimeError(
+                "Server `%(server)s' is not connected to any network. "
+                "Use network context for auto-assigning networks "
+                "or provide `nics' argument with specific net-id." % {
+                    "server": iperf_client.name})
+        if not iperf_server.networks:
+            raise RuntimeError(
+                "Server `%(server)s' is not connected to any network. "
+                "Use network context for auto-assigning networks "
+                "or provide `nics' argument with specific net-id." % {
+                    "server": iperf_server.name})
+
+        client_internal_network = iperf_client.networks.keys()[0]
+        server_internal_network = iperf_server.networks.keys()[0]
+
+        client_fixed_ip = iperf_client.addresses[client_internal_network][0]["addr"]
+        server_fixed_ip = iperf_server.addresses[server_internal_network][0]["addr"]
+
+        # ysboychakov: update script to allow client get the server's ip
+        with open(clientscript, 'r+') as file:
+            #content = file.read().replace("10.2.0.4", server_fixed_ip)
+            content = file.read()
+            new_content = re.sub("iperf -c (\d{1,3}[.]){3}\d{1,3}", "iperf -c " + server_fixed_ip, content)
+            file.seek(0)
+            file.truncate()
+            file.write(new_content)
+
+        # check clientscript after change
+        #print "Client script: ", open(clientscript, 'r').read()
+
+        #ysboychakov: check ssh related variables
+        print "client_internal_network: ", client_internal_network
+        print "server_internal_network: ", server_internal_network
+        print "client_fixed_ip: ", client_fixed_ip
+        print "server_fixed_ip: ", server_fixed_ip
+
+        try:
+            client_floating_ip = net_wrap.create_floating_ip(ext_network=floating_network,
+                                              int_network=client_internal_network,
+                                              tenant_id=iperf_client.tenant_id,
+                                              fixed_ip=client_fixed_ip)
+            server_floating_ip = net_wrap.create_floating_ip(ext_network=floating_network,
+                                              int_network=server_internal_network,
+                                              tenant_id=iperf_server.tenant_id,
+                                              fixed_ip=server_fixed_ip)
+
+            print "floating ip1: ", client_floating_ip
+            print "floating ip2: ", server_floating_ip
+
+            self._associate_floating_ip(iperf_client, client_floating_ip["ip"],
+                                        fixed_address=client_fixed_ip)
+            self._associate_floating_ip(iperf_server, server_floating_ip["ip"],
+                                        fixed_address=server_fixed_ip)
+
+            def runclient():
+                print "runclient() called. Time: ", time.strftime("%H:%M:%S")
+                #ysboychakov: sleeping to let server thread launch
+                time.sleep(20)
+                code, out, err = self.run_command(client_floating_ip["ip"], port, username,
+                                              password, interpreter, clientscript)
+                print "Client script result:"
+                print "code1: %s" % code
+                print "out1: %s " % out
+                print "err1: %s" % err
+                print "Finished client thread.."
+
+            def runserver():
+                print " runserver() called. Time: ", time.strftime("%H:%M:%S")
+                code, out, err = self.run_command(server_floating_ip["ip"], port, username,
+                                              password, interpreter, serverscript)
+                print "Server script result:"
+                print "code2: %s" %code
+                print "out2: %s " % out
+                print "err2: %s" % err
+                print "Finished server thread.."
+
+
+
+            print "Running server and client.."
+            th1 = threading.Thread(None, runserver, None)
+            th2 = threading.Thread(None, runclient, None)
+
+
+            #ysboychakov: run server first
+            th1.start()
+             #ysboychakov: sleeping to let server thread launch
+            #time.sleep(20)
+
+            th2.start()
+
+            th1.join()
+            th2.join()
+
+            """
+            if code:
+                raise exceptions.ScriptError(
+                    "Error running script %(script)s."
+                    "Error %(code)s: %(error)s" % {
+                        "script": script, "code": code, "error": err})
+            try:
+                data = json.loads(out)
+            except ValueError as e:
+                raise exceptions.ScriptError(
+                    "Script %(script)s has not output valid JSON: "
+                    "%(error)s" % {"script": script, "error": str(e)})
+
+            """
+            return {"data": "data", "errors": "err"}
+
+        finally:
+
+            if iperf_client:
+                if client_floating_ip:
+                    if self.check_ip_address(client_floating_ip["ip"])(iperf_client):
+                        self._dissociate_floating_ip(iperf_client, client_floating_ip["ip"])
+                    net_wrap.delete_floating_ip(client_floating_ip["id"], wait=True)
+                self._delete_server(iperf_client, force=force_delete)
+
+            if iperf_server:
+                if server_floating_ip:
+                    if self.check_ip_address(server_floating_ip["ip"])(iperf_client):
+                        self._dissociate_floating_ip(iperf_server, client_floating_ip["ip"])
+                    net_wrap.delete_floating_ip(server_floating_ip["id"], wait=True)
+                self._delete_server(iperf_server, force=force_delete)
