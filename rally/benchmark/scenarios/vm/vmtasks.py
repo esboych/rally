@@ -158,8 +158,10 @@ class VMTasks(nova_utils.NovaScenario, vm_utils.VMScenario,
 
         :param image: glance image name to use for the vm
         :param flavor: VM flavor name
-        :param script: script to run on server, must output JSON mapping
+        :param clientscript: script to run on iperf client VM, must output JSON mapping
                        metric names to values (see the sample script below)
+        :param serverscript: script to run on iperf server VM, must output JSON mapping
+               metric names to values
         :param interpreter: server's interpreter to run the script
         :param username: ssh username on server, str
         :param password: Password on SSH authentication
@@ -172,8 +174,6 @@ class VMTasks(nova_utils.NovaScenario, vm_utils.VMScenario,
                   data: dict, JSON output from the script
                   errors: str, raw data from the script's stderr stream
         """
-
-        print "boot_runcommand_on_two_servers_delete"
 
         if volume_args:
             volume = self._create_volume(volume_args["size"], imageRef=None)
@@ -188,10 +188,6 @@ class VMTasks(nova_utils.NovaScenario, vm_utils.VMScenario,
         iperf_client = self._boot_server(
             self._generate_random_name("rally_iperf_client_"),
             image, flavor, **kwargs)
-
-        print " sleeping 10 sec.."
-        time.sleep(10)
-        print " end sleeping 10 sec.."
 
         iperf_server = self._boot_server(
             self._generate_random_name("rally_iperf_server_"),
@@ -217,23 +213,15 @@ class VMTasks(nova_utils.NovaScenario, vm_utils.VMScenario,
         client_fixed_ip = iperf_client.addresses[client_internal_network][0]["addr"]
         server_fixed_ip = iperf_server.addresses[server_internal_network][0]["addr"]
 
-        # ysboychakov: update script to allow client get the server's ip
+        # ysboychakov: update client script file to allow client get the server's ip
         with open(clientscript, 'r+') as file:
-            #content = file.read().replace("10.2.0.4", server_fixed_ip)
             content = file.read()
-            new_content = re.sub("iperf -c (\d{1,3}[.]){3}\d{1,3}", "iperf -c " + server_fixed_ip, content)
+            ip_pattern = "iperf -c (\d{1,3}[.]){3}\d{1,3}"
+            ip_value = "iperf -c " + server_fixed_ip
+            new_content = re.sub(ip_pattern, ip_value, content)
             file.seek(0)
             file.truncate()
             file.write(new_content)
-
-        # check clientscript after change
-        #print "Client script: ", open(clientscript, 'r').read()
-
-        #ysboychakov: check ssh related variables
-        print "client_internal_network: ", client_internal_network
-        print "server_internal_network: ", server_internal_network
-        print "client_fixed_ip: ", client_fixed_ip
-        print "server_fixed_ip: ", server_fixed_ip
 
         try:
             client_floating_ip = net_wrap.create_floating_ip(ext_network=floating_network,
@@ -245,68 +233,69 @@ class VMTasks(nova_utils.NovaScenario, vm_utils.VMScenario,
                                               tenant_id=iperf_server.tenant_id,
                                               fixed_ip=server_fixed_ip)
 
-            print "floating ip1: ", client_floating_ip
-            print "floating ip2: ", server_floating_ip
-
             self._associate_floating_ip(iperf_client, client_floating_ip["ip"],
                                         fixed_address=client_fixed_ip)
             self._associate_floating_ip(iperf_server, server_floating_ip["ip"],
                                         fixed_address=server_fixed_ip)
 
+            # ysboychakov: Queue instance to get results out of server thread
+            res_q = Queue.Queue()
+
             def runclient():
-                print "runclient() called. Time: ", time.strftime("%H:%M:%S")
-                #ysboychakov: sleeping to let server thread launch
                 time.sleep(20)
                 code, out, err = self.run_command(client_floating_ip["ip"], port, username,
                                               password, interpreter, clientscript)
-                print "Client script result:"
-                print "code1: %s" % code
-                print "out1: %s " % out
-                print "err1: %s" % err
-                print "Finished client thread.."
 
             def runserver():
                 print " runserver() called. Time: ", time.strftime("%H:%M:%S")
                 code, out, err = self.run_command(server_floating_ip["ip"], port, username,
                                               password, interpreter, serverscript)
-                print "Server script result:"
-                print "code2: %s" %code
-                print "out2: %s " % out
-                print "err2: %s" % err
-                print "Finished server thread.."
+                res_q.put(out)
+                res_q.put(code)
+                res_q.put(err)
 
 
-
-            print "Running server and client.."
             th1 = threading.Thread(None, runserver, None)
             th2 = threading.Thread(None, runclient, None)
 
 
             #ysboychakov: run server first
             th1.start()
-             #ysboychakov: sleeping to let server thread launch
-            #time.sleep(20)
-
             th2.start()
 
             th1.join()
             th2.join()
 
-            """
+            #ysboychakov: ensure no ScriptError raised
+            code = 0;
+
+            server_response = res_q.get()
+            code = res_q.get()
+            err = res_q.get()
+
+            r_pattern = 'sec .* GBytes (.*) [G,M]bits/sec'
+            iperf_result = ""
+            match = re.search(r_pattern, server_response)
+            if match:
+                iperf_result = match.group(1)
+
+            out = '{"network performance" : ' + iperf_result + ' }'
+
             if code:
                 raise exceptions.ScriptError(
                     "Error running script %(script)s."
                     "Error %(code)s: %(error)s" % {
-                        "script": script, "code": code, "error": err})
+                        "script": clientscript, "code": code, "error": err})
             try:
                 data = json.loads(out)
             except ValueError as e:
                 raise exceptions.ScriptError(
                     "Script %(script)s has not output valid JSON: "
-                    "%(error)s" % {"script": script, "error": str(e)})
+                    "%(error)s" % {"script": clientscript, "error": str(e)})
 
-            """
-            return {"data": "data", "errors": "err"}
+
+
+            return {"data": data, "errors": err}
 
         finally:
 
